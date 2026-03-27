@@ -28,7 +28,7 @@ jobs:
       - name: Install MQTT client
         run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
 
-      - name: Build desired state payload
+      - name: Build and publish desired state
         id: payload
         run: |
           CONTAINER_NAME="${{ inputs.container_name }}"
@@ -36,57 +36,65 @@ jobs:
             CONTAINER_NAME=$(echo "${{ inputs.image }}" | awk -F'/' '{print $NF}')
           fi
           ACTIVITY_ID="gha-${{ github.run_id }}-${{ github.run_number }}"
-          TOPIC="command///req/${ACTIVITY_ID}/updateContainers"
+          CORRELATION_ID="${ACTIVITY_ID}"
+          MQTT_TOPIC="command///req/${CORRELATION_ID}/apply"
 
+          # Suite Connector expects Ditto protocol envelope
           PAYLOAD=$(cat <<EOF
           {
-            "activityId": "${ACTIVITY_ID}",
-            "timestamp": "$(date +%s)000",
-            "payload": {
-              "domains": [
-                {
-                  "id": "containers",
-                  "components": [
-                    {
-                      "id": "${CONTAINER_NAME}",
-                      "version": "${{ inputs.version }}",
-                      "config": [
-                        {
-                          "key": "image",
-                          "value": "${{ inputs.image }}:${{ inputs.version }}"
-                        }
-                      ]
-                    }
-                  ]
-                }
-              ]
+            "topic": "ota/device-tuan/things/live/messages/apply",
+            "headers": {
+              "content-type": "application/json",
+              "correlation-id": "${CORRELATION_ID}",
+              "response-required": false
+            },
+            "path": "/features/UpdateManager/inbox/messages/apply",
+            "value": {
+              "activityId": "${ACTIVITY_ID}",
+              "timestamp": "${ACTIVITY_ID}",
+              "payload": {
+                "domains": [
+                  {
+                    "id": "containers",
+                    "components": [
+                      {
+                        "id": "${CONTAINER_NAME}",
+                        "version": "${{ inputs.version }}",
+                        "config": [
+                          {
+                            "key": "image",
+                            "value": "${{ inputs.image }}:${{ inputs.version }}"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
             }
           }
           EOF
           )
 
-          echo "topic=${TOPIC}" >> "$GITHUB_OUTPUT"
           echo "container_name=${CONTAINER_NAME}" >> "$GITHUB_OUTPUT"
-          # Save payload to file (avoids shell escaping issues)
+          echo "mqtt_topic=${MQTT_TOPIC}" >> "$GITHUB_OUTPUT"
           echo "$PAYLOAD" > /tmp/payload.json
 
-          echo "📦 Desired State:"
+          echo "📦 Desired State (Ditto envelope):"
           cat /tmp/payload.json | python3 -m json.tool
 
-      - name: Publish OTA command via MQTT
-        run: |
           echo "🚀 Publishing to ${{ env.MQTT_HOST }}:1883"
-          echo "   Topic: ${{ steps.payload.outputs.topic }}"
+          echo "   Topic: ${MQTT_TOPIC}"
 
           mosquitto_pub \
             -h "${{ env.MQTT_HOST }}" \
             -p 1883 \
             -u "${{ env.MQTT_USER }}" \
             -P "${{ env.MQTT_PASS }}" \
-            -t "${{ steps.payload.outputs.topic }}" \
+            -t "${MQTT_TOPIC}" \
             -f /tmp/payload.json
 
-          echo "✅ OTA command published successfully!"
+          echo "✅ OTA command published!"
 
       - name: Summary
         if: always()
@@ -98,5 +106,5 @@ jobs:
           echo "| Image | \`${{ inputs.image }}:${{ inputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Container | \`${{ steps.payload.outputs.container_name }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| MQTT Broker | \`${{ env.MQTT_HOST }}:1883\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Topic | \`${{ steps.payload.outputs.topic }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Topic | \`${{ steps.payload.outputs.mqtt_topic }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
