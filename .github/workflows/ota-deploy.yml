@@ -41,7 +41,7 @@ jobs:
           PAYLOAD=$(cat <<EOF
           {
             "activityId": "${ACTIVITY_ID}",
-            "timestamp": $(date +%s)000,
+            "timestamp": "$(date +%s)000",
             "payload": {
               "domains": [
                 {
