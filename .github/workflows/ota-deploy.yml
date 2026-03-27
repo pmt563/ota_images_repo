@@ -35,33 +35,43 @@ jobs:
           if [ -z "$CONTAINER_NAME" ]; then
             CONTAINER_NAME=$(echo "${{ inputs.image }}" | awk -F'/' '{print $NF}')
           fi
-          ACTIVITY_ID="gha-${{ github.run_id }}-${{ github.run_number }}"
-          TIMESTAMP="$(date +%s)000"
-          MQTT_TOPIC="command///req/${ACTIVITY_ID}/apply"
+          CORRELATION_ID="gha-${{ github.run_id }}-${{ github.run_number }}"
+          ACTIVITY_ID="${CORRELATION_ID}"
+          # Subject MUST be "um" for Suite Connector to route to Update Manager
+          MQTT_TOPIC="command///req/${CORRELATION_ID}/um"
 
-          # Raw desired state payload (Suite Connector wraps in Ditto internally)
+          # Ditto protocol envelope (matches hono_commands_um.py format)
           PAYLOAD=$(cat <<EOF
           {
-            "activityId": "${ACTIVITY_ID}",
-            "timestamp": "${TIMESTAMP}",
-            "payload": {
-              "domains": [
-                {
-                  "id": "containers",
-                  "components": [
-                    {
-                      "id": "${CONTAINER_NAME}",
-                      "version": "${{ inputs.version }}",
-                      "config": [
-                        {
-                          "key": "image",
-                          "value": "${{ inputs.image }}:${{ inputs.version }}"
-                        }
-                      ]
-                    }
-                  ]
-                }
-              ]
+            "topic": "ota/device-tuan/things/live/messages/apply",
+            "headers": {
+              "content-type": "application/json",
+              "correlation-id": "${CORRELATION_ID}",
+              "response-required": false
+            },
+            "path": "/features/UpdateManager/inbox/messages/apply",
+            "value": {
+              "activityId": "${ACTIVITY_ID}",
+              "desiredState": {
+                "domains": [
+                  {
+                    "id": "containers",
+                    "config": [],
+                    "components": [
+                      {
+                        "id": "${CONTAINER_NAME}",
+                        "version": "${{ inputs.version }}",
+                        "config": [
+                          {
+                            "key": "image",
+                            "value": "${{ inputs.image }}:${{ inputs.version }}"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
             }
           }
           EOF
@@ -71,7 +81,7 @@ jobs:
           echo "mqtt_topic=${MQTT_TOPIC}" >> "$GITHUB_OUTPUT"
           echo "$PAYLOAD" > /tmp/payload.json
 
-          echo "📦 Desired State:"
+          echo "📦 Desired State (Ditto envelope):"
           cat /tmp/payload.json | python3 -m json.tool
 
           echo "🚀 Publishing to ${{ env.MQTT_HOST }}:1883"
