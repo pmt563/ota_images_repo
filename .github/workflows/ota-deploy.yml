@@ -1,0 +1,102 @@
+name: OTA Deploy via MQTT
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Container image to deploy (e.g., ghcr.io/pmt563/hr-zonal)'
+        required: true
+        type: string
+      version:
+        description: 'Image version/tag to deploy'
+        required: true
+        type: string
+      container_name:
+        description: 'Container name on edge device (default: derived from image)'
+        required: false
+        type: string
+
+env:
+  MQTT_HOST: ${{ secrets.GCP_VM_HOST }}
+  MQTT_USER: github-ci
+  MQTT_PASS: ${{ secrets.MQTT_CI_PASSWORD }}
+
+jobs:
+  send-ota-command:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install MQTT client
+        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
+
+      - name: Build desired state payload
+        id: payload
+        run: |
+          CONTAINER_NAME="${{ inputs.container_name }}"
+          if [ -z "$CONTAINER_NAME" ]; then
+            CONTAINER_NAME=$(echo "${{ inputs.image }}" | awk -F'/' '{print $NF}')
+          fi
+          ACTIVITY_ID="gha-${{ github.run_id }}-${{ github.run_number }}"
+          TOPIC="command///req/${ACTIVITY_ID}/updateContainers"
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "activityId": "${ACTIVITY_ID}",
+            "timestamp": $(date +%s)000,
+            "payload": {
+              "domains": [
+                {
+                  "id": "containers",
+                  "components": [
+                    {
+                      "id": "${CONTAINER_NAME}",
+                      "version": "${{ inputs.version }}",
+                      "config": [
+                        {
+                          "key": "image",
+                          "value": "${{ inputs.image }}:${{ inputs.version }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          }
+          EOF
+          )
+
+          echo "topic=${TOPIC}" >> "$GITHUB_OUTPUT"
+          echo "container_name=${CONTAINER_NAME}" >> "$GITHUB_OUTPUT"
+          # Save payload to file (avoids shell escaping issues)
+          echo "$PAYLOAD" > /tmp/payload.json
+
+          echo "📦 Desired State:"
+          cat /tmp/payload.json | python3 -m json.tool
+
+      - name: Publish OTA command via MQTT
+        run: |
+          echo "🚀 Publishing to ${{ env.MQTT_HOST }}:1883"
+          echo "   Topic: ${{ steps.payload.outputs.topic }}"
+
+          mosquitto_pub \
+            -h "${{ env.MQTT_HOST }}" \
+            -p 1883 \
+            -u "${{ env.MQTT_USER }}" \
+            -P "${{ env.MQTT_PASS }}" \
+            -t "${{ steps.payload.outputs.topic }}" \
+            -f /tmp/payload.json
+
+          echo "✅ OTA command published successfully!"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🚀 OTA Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ inputs.image }}:${{ inputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container | \`${{ steps.payload.outputs.container_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| MQTT Broker | \`${{ env.MQTT_HOST }}:1883\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Topic | \`${{ steps.payload.outputs.topic }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
