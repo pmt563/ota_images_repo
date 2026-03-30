@@ -4,13 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       image:
-        description: 'Container image to deploy (e.g., ghcr.io/pmt563/hr-zonal)'
+        description: 'Select container image from GHCR packages'
         required: true
-        type: string
+        type: choice
+        options:
+          - ghcr.io/pmt563/vs_bsr_zonal_x86
+          - docker.io/library/nginx
+          - docker.io/library/hello-world
       version:
-        description: 'Image version/tag to deploy'
-        required: true
+        description: 'Image version/tag (leave blank to auto-detect latest)'
+        required: false
         type: string
+        default: ''
+      target_device:
+        description: 'Target edge device to deploy to'
+        required: true
+        type: choice
+        options:
+          - device-tuan
+          - device-huong
       container_name:
         description: 'Container name on edge device (default: derived from image)'
         required: false
@@ -25,8 +37,58 @@ jobs:
   send-ota-command:
     runs-on: ubuntu-latest
     steps:
-      - name: Install MQTT client
-        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients jq skopeo
+
+      - name: Resolve target device identity
+        id: device
+        run: |
+          TARGET="${{ inputs.target_device }}"
+
+          if [ "$TARGET" == "device-tuan" ]; then
+            TENANT_ID="ota"
+            DEVICE_ID="device-tuan"
+          elif [ "$TARGET" == "device-huong" ]; then
+            TENANT_ID="ota1"
+            DEVICE_ID="device-huong"
+          else
+            echo "❌ Unknown target device: $TARGET"
+            exit 1
+          fi
+
+          echo "tenant_id=${TENANT_ID}" >> "$GITHUB_OUTPUT"
+          echo "device_id=${DEVICE_ID}" >> "$GITHUB_OUTPUT"
+          echo "📍 Target: ${DEVICE_ID} (tenant: ${TENANT_ID})"
+
+      - name: Auto-detect latest image version
+        id: detect
+        run: |
+          VERSION="${{ inputs.version }}"
+          IMAGE="${{ inputs.image }}"
+
+          if [ -z "$VERSION" ] || [ "$VERSION" == "latest" ]; then
+            echo "🔍 Auto-detecting latest version for $IMAGE..."
+
+            if [[ "$IMAGE" == ghcr.io/* ]]; then
+              TAGS_JSON=$(skopeo list-tags --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} docker://$IMAGE)
+            else
+              TAGS_JSON=$(skopeo list-tags docker://$IMAGE)
+            fi
+
+            LATEST_TAG=$(echo "$TAGS_JSON" | jq -r '.Tags[]' | grep -v -E 'latest|^v?0\.0\.0' | sort -V | tail -n 1)
+
+            if [ -n "$LATEST_TAG" ]; then
+              VERSION=$LATEST_TAG
+              echo "✅ Detected latest version: $VERSION"
+            else
+              echo "⚠️ No semantic version found, falling back to 'latest'"
+              VERSION="latest"
+            fi
+          else
+            echo "✅ Using provided version: $VERSION"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build and publish desired state
         id: payload
@@ -35,15 +97,21 @@ jobs:
           if [ -z "$CONTAINER_NAME" ]; then
             CONTAINER_NAME=$(echo "${{ inputs.image }}" | awk -F'/' '{print $NF}')
           fi
+
+          DETECTED_VERSION="${{ steps.detect.outputs.version }}"
+          TENANT_ID="${{ steps.device.outputs.tenant_id }}"
+          DEVICE_ID="${{ steps.device.outputs.device_id }}"
+
           CORRELATION_ID="gha-${{ github.run_id }}-${{ github.run_number }}"
           ACTIVITY_ID="${CORRELATION_ID}"
+
           # Subject MUST be "um" for Suite Connector to route to Update Manager
           MQTT_TOPIC="command///req/${CORRELATION_ID}/um"
 
-          # Ditto protocol envelope (matches hono_commands_um.py format)
+          # Ditto protocol envelope — topic field routes to the correct device
           PAYLOAD=$(cat <<EOF
           {
-            "topic": "ota/device-tuan/things/live/messages/apply",
+            "topic": "${TENANT_ID}/${DEVICE_ID}/things/live/messages/apply",
             "headers": {
               "content-type": "application/json",
               "correlation-id": "${CORRELATION_ID}",
@@ -60,11 +128,11 @@ jobs:
                     "components": [
                       {
                         "id": "${CONTAINER_NAME}",
-                        "version": "${{ inputs.version }}",
+                        "version": "${DETECTED_VERSION}",
                         "config": [
                           {
                             "key": "image",
-                            "value": "${{ inputs.image }}:${{ inputs.version }}"
+                            "value": "${{ inputs.image }}:${DETECTED_VERSION}"
                           }
                         ]
                       }
@@ -79,6 +147,9 @@ jobs:
 
           echo "container_name=${CONTAINER_NAME}" >> "$GITHUB_OUTPUT"
           echo "mqtt_topic=${MQTT_TOPIC}" >> "$GITHUB_OUTPUT"
+          echo "final_image=${{ inputs.image }}:${DETECTED_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "target=${DEVICE_ID}@${TENANT_ID}" >> "$GITHUB_OUTPUT"
+
           echo "$PAYLOAD" > /tmp/payload.json
 
           echo "📦 Desired State (Ditto envelope):"
@@ -86,6 +157,7 @@ jobs:
 
           echo "🚀 Publishing to ${{ env.MQTT_HOST }}:1883"
           echo "   Topic: ${MQTT_TOPIC}"
+          echo "   Target Device: ${DEVICE_ID} (tenant: ${TENANT_ID})"
 
           mosquitto_pub \
             -h "${{ env.MQTT_HOST }}" \
@@ -104,8 +176,9 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`${{ inputs.image }}:${{ inputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ steps.payload.outputs.final_image }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Container | \`${{ steps.payload.outputs.container_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Target Device | \`${{ steps.payload.outputs.target }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| MQTT Broker | \`${{ env.MQTT_HOST }}:1883\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Topic | \`${{ steps.payload.outputs.mqtt_topic }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
