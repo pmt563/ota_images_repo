@@ -21,6 +21,7 @@ on:
         required: true
         type: choice
         options:
+          - all-devices
           - device-tuan
           - device-huong
       container_name:
@@ -34,31 +35,34 @@ env:
   MQTT_PASS: ${{ secrets.MQTT_CI_PASSWORD }}
 
 jobs:
-  send-ota-command:
+  # Build the list of target devices as a JSON matrix
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      version: ${{ steps.detect.outputs.version }}
     steps:
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients jq skopeo
-
-      - name: Resolve target device identity
-        id: device
+      - name: Set device matrix
+        id: set-matrix
         run: |
           TARGET="${{ inputs.target_device }}"
 
-          if [ "$TARGET" == "device-tuan" ]; then
-            TENANT_ID="ota"
-            DEVICE_ID="device-tuan"
+          if [ "$TARGET" == "all-devices" ]; then
+            MATRIX='[{"device_id":"device-tuan","tenant_id":"ota"},{"device_id":"device-huong","tenant_id":"ota1"}]'
+          elif [ "$TARGET" == "device-tuan" ]; then
+            MATRIX='[{"device_id":"device-tuan","tenant_id":"ota"}]'
           elif [ "$TARGET" == "device-huong" ]; then
-            TENANT_ID="ota1"
-            DEVICE_ID="device-huong"
+            MATRIX='[{"device_id":"device-huong","tenant_id":"ota1"}]'
           else
             echo "❌ Unknown target device: $TARGET"
             exit 1
           fi
 
-          echo "tenant_id=${TENANT_ID}" >> "$GITHUB_OUTPUT"
-          echo "device_id=${DEVICE_ID}" >> "$GITHUB_OUTPUT"
-          echo "📍 Target: ${DEVICE_ID} (tenant: ${TENANT_ID})"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "📍 Targets: ${MATRIX}"
+
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo jq
 
       - name: Auto-detect latest image version
         id: detect
@@ -90,7 +94,19 @@ jobs:
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build and publish desired state
+  # Deploy to each device in parallel
+  send-ota-command:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Install MQTT client
+        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
+
+      - name: "Deploy to ${{ matrix.target.device_id }}"
         id: payload
         run: |
           CONTAINER_NAME="${{ inputs.container_name }}"
@@ -98,11 +114,11 @@ jobs:
             CONTAINER_NAME=$(echo "${{ inputs.image }}" | awk -F'/' '{print $NF}')
           fi
 
-          DETECTED_VERSION="${{ steps.detect.outputs.version }}"
-          TENANT_ID="${{ steps.device.outputs.tenant_id }}"
-          DEVICE_ID="${{ steps.device.outputs.device_id }}"
+          DETECTED_VERSION="${{ needs.prepare.outputs.version }}"
+          TENANT_ID="${{ matrix.target.tenant_id }}"
+          DEVICE_ID="${{ matrix.target.device_id }}"
 
-          CORRELATION_ID="gha-${{ github.run_id }}-${{ github.run_number }}"
+          CORRELATION_ID="gha-${{ github.run_id }}-${{ github.run_number }}-${DEVICE_ID}"
           ACTIVITY_ID="${CORRELATION_ID}"
 
           # Subject MUST be "um" for Suite Connector to route to Update Manager
@@ -152,7 +168,7 @@ jobs:
 
           echo "$PAYLOAD" > /tmp/payload.json
 
-          echo "📦 Desired State (Ditto envelope):"
+          echo "📦 Desired State for ${DEVICE_ID}:"
           cat /tmp/payload.json | python3 -m json.tool
 
           echo "🚀 Publishing to ${{ env.MQTT_HOST }}:1883"
@@ -167,12 +183,12 @@ jobs:
             -t "${MQTT_TOPIC}" \
             -f /tmp/payload.json
 
-          echo "✅ OTA command published!"
+          echo "✅ OTA command published to ${DEVICE_ID}!"
 
       - name: Summary
         if: always()
         run: |
-          echo "## 🚀 OTA Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## 🚀 OTA Deploy → ${{ matrix.target.device_id }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
