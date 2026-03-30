@@ -24,6 +24,7 @@ on:
           - all-devices
           - device-tuan
           - device-huong
+          - device-pi
       container_name:
         description: 'Container name on edge device (default: derived from image)'
         required: false
@@ -35,7 +36,6 @@ env:
   MQTT_PASS: ${{ secrets.MQTT_CI_PASSWORD }}
 
 jobs:
-  # Build the list of target devices as a JSON matrix
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -48,18 +48,20 @@ jobs:
           TARGET="${{ inputs.target_device }}"
 
           if [ "$TARGET" == "all-devices" ]; then
-            MATRIX='[{"device_id":"device-tuan","tenant_id":"ota"},{"device_id":"device-huong","tenant_id":"ota1"}]'
+            MATRIX='[{"device_id":"device-tuan","tenant_id":"ota"},{"device_id":"device-huong","tenant_id":"ota1"},{"device_id":"device-pi","tenant_id":"ota"}]'
           elif [ "$TARGET" == "device-tuan" ]; then
             MATRIX='[{"device_id":"device-tuan","tenant_id":"ota"}]'
           elif [ "$TARGET" == "device-huong" ]; then
             MATRIX='[{"device_id":"device-huong","tenant_id":"ota1"}]'
+          elif [ "$TARGET" == "device-pi" ]; then
+            MATRIX='[{"device_id":"device-pi","tenant_id":"ota"}]'
           else
-            echo "❌ Unknown target device: $TARGET"
+            echo "Unknown target device: $TARGET"
             exit 1
           fi
 
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
-          echo "📍 Targets: ${MATRIX}"
+          echo "Targets: ${MATRIX}"
 
       - name: Install skopeo
         run: sudo apt-get update && sudo apt-get install -y skopeo jq
@@ -71,7 +73,7 @@ jobs:
           IMAGE="${{ inputs.image }}"
 
           if [ -z "$VERSION" ] || [ "$VERSION" == "latest" ]; then
-            echo "🔍 Auto-detecting latest version for $IMAGE..."
+            echo "Auto-detecting latest version for $IMAGE..."
 
             if [[ "$IMAGE" == ghcr.io/* ]]; then
               TAGS_JSON=$(skopeo list-tags --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} docker://$IMAGE)
@@ -83,18 +85,16 @@ jobs:
 
             if [ -n "$LATEST_TAG" ]; then
               VERSION=$LATEST_TAG
-              echo "✅ Detected latest version: $VERSION"
+              echo "Detected latest version: $VERSION"
             else
-              echo "⚠️ No semantic version found, falling back to 'latest'"
+              echo "No semantic version found, falling back to 'latest'"
               VERSION="latest"
             fi
           else
-            echo "✅ Using provided version: $VERSION"
+            echo "Using provided version: $VERSION"
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-  # Deploy to each device in parallel
   send-ota-command:
     needs: prepare
     runs-on: ubuntu-latest
@@ -168,12 +168,12 @@ jobs:
 
           echo "$PAYLOAD" > /tmp/payload.json
 
-          echo "📦 Desired State for ${DEVICE_ID}:"
+          echo "Desired State for ${DEVICE_ID}:"
           cat /tmp/payload.json | python3 -m json.tool
 
-          echo "🚀 Publishing to ${{ env.MQTT_HOST }}:1883"
-          echo "   Topic: ${MQTT_TOPIC}"
-          echo "   Target Device: ${DEVICE_ID} (tenant: ${TENANT_ID})"
+          echo "Publishing to ${{ env.MQTT_HOST }}:1883"
+          echo "Topic: ${MQTT_TOPIC}"
+          echo "Target Device: ${DEVICE_ID} (tenant: ${TENANT_ID})"
 
           mosquitto_pub \
             -h "${{ env.MQTT_HOST }}" \
@@ -183,12 +183,12 @@ jobs:
             -t "${MQTT_TOPIC}" \
             -f /tmp/payload.json
 
-          echo "✅ OTA command published to ${DEVICE_ID}!"
+          echo "OTA command published to ${DEVICE_ID}!"
 
       - name: Summary
         if: always()
         run: |
-          echo "## 🚀 OTA Deploy → ${{ matrix.target.device_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "## OTA Deploy → ${{ matrix.target.device_id }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
