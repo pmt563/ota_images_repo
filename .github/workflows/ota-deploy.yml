@@ -371,14 +371,15 @@ jobs:
           echo "=========================================="
           
           # ===== PUBLISH MQTT MESSAGE =====
+          # QUAN TRỌNG: Không có dấu \ ở cuối dòng
           echo "📡 Publishing to MQTT broker at ${{ env.MQTT_HOST }}:1883..."
           mosquitto_pub \
-            -h "${{ env.MQTT_HOST }}" \                  # MQTT broker host
-            -p 1883 \                                     # MQTT port
-            -u "${{ env.MQTT_USER }}" \                  # MQTT username
-            -P "${{ env.MQTT_PASS }}" \                  # MQTT password
-            -t "${MQTT_TOPIC}" \                         # MQTT topic
-            -f /tmp/payload.json                         # Payload file
+            -h "${{ env.MQTT_HOST }}" \
+            -p 1883 \
+            -u "${{ env.MQTT_USER }}" \
+            -P "${{ env.MQTT_PASS }}" \
+            -t "${MQTT_TOPIC}" \
+            -f /tmp/payload.json
           
           # Kiểm tra kết quả publish
           if [ $? -eq 0 ]; then
