@@ -60,10 +60,10 @@ on:
       
       # ===== PHẦN 3: CẤU HÌNH CONTAINER =====
       container_name:
-        description: 'Container name on edge device (leave blank for auto-detect)'
+        description: 'Container name on edge device (leave blank for auto-detect with unique suffix)'
         required: false
         type: string
-        default: ''                                        # Để trống để auto-detect
+        default: ''                                        # Để trống để auto-detect với suffix unique
       
       # ===== PHẦN 4: CẤU HÌNH DEPLOYMENT =====
       deployment_mode:
@@ -74,6 +74,13 @@ on:
           - parallel                                        # Deploy đồng thời tất cả
           - sequential                                      # Deploy tuần tự từng cái
         default: 'parallel'                                # Mặc định chạy song song
+      
+      # ===== PHẦN 5: CẤU HÌNH CONTAINER NAME UNIQUE =====
+      use_unique_container_name:
+        description: 'Auto-generate unique container names (prevents overwriting)'
+        required: false
+        type: boolean
+        default: true                                      # Mặc định tạo tên unique
 
 # ===== BIẾN MÔI TRƯỜNG =====
 # Lưu trữ thông tin kết nối MQTT broker
@@ -285,14 +292,38 @@ jobs:
       - name: "Deploy ${{ matrix.image.name }} (${{ matrix.image.full }}) to ${{ matrix.device.device_id }}"
         id: payload                                       # ID để tham chiếu outputs
         run: |
-          # ===== XÁC ĐỊNH TÊN CONTAINER =====
-          # Nếu user nhập container name thì dùng, không thì auto-detect từ image
-          CONTAINER_NAME="${{ inputs.container_name }}"
-          if [ -z "$CONTAINER_NAME" ]; then
-            # Lấy tên image (phần cuối cùng sau dấu /)
-            # Ví dụ: docker.io/library/nginx -> nginx
-            CONTAINER_NAME="${{ matrix.image.name }}"
+          # ===== XÁC ĐỊNH TÊN CONTAINER DUY NHẤT =====
+          # Tạo container name duy nhất để tránh ghi đè khi deploy nhiều images
+          # Nếu user chỉ định container name thì dùng user input
+          # Nếu không, tự động tạo container name unique với suffix là timestamp hoặc image name
+          
+          if [ -n "${{ inputs.container_name }}" ]; then
+            # User đã chỉ định container name cụ thể
+            CONTAINER_NAME="${{ inputs.container_name }}"
+            echo "⚠️  Using user-specified container name: ${CONTAINER_NAME}"
+            echo "⚠️  Warning: If deploying multiple images with same name, they will overwrite each other!"
+          else
+            # Auto-detect với cơ chế unique
+            if [ "${{ inputs.use_unique_container_name }}" == "true" ]; then
+              # Tạo container name duy nhất: <image_name>_<device_id>_<short_id>
+              # Lấy tên image base (phần cuối cùng sau dấu /)
+              IMAGE_BASE="${{ matrix.image.name }}"
+              # Lấy device ID ngắn gọn
+              DEVICE_SHORT="${{ matrix.device.device_id }}"
+              # Tạo short ID từ run_id và image index (đảm bảo unique)
+              SHORT_ID="${GITHUB_RUN_ID: -6}-${{ strategy.job-index }}"
+              
+              CONTAINER_NAME="${IMAGE_BASE}_${DEVICE_SHORT}_${SHORT_ID}"
+              echo "✓ Generated unique container name: ${CONTAINER_NAME}"
+            else
+              # Cách cũ: chỉ dùng tên image (có thể bị ghi đè)
+              CONTAINER_NAME="${{ matrix.image.name }}"
+              echo "⚠️  Using simple container name: ${CONTAINER_NAME} (may overwrite existing containers)"
+            fi
           fi
+          
+          # Thay thế các ký tự đặc biệt không hợp lệ trong container name
+          CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-zA-Z0-9_.-]/-/g')
           
           # Lấy thông tin từ matrix
           TENANT_ID="${{ matrix.device.tenant_id }}"     # Tenant của device
@@ -438,6 +469,7 @@ jobs:
           echo "- **Target**: ${{ inputs.target_device }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Mode**: ${{ inputs.deployment_mode }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Tag**: ${{ inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Unique Container Names**: ${{ inputs.use_unique_container_name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Phần danh sách images đã deploy
