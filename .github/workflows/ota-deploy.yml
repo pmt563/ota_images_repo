@@ -100,6 +100,10 @@ jobs:
       images: ${{ steps.build-images-list.outputs.images }}          # Danh sách images
     
     steps:
+      # Cài đặt jq trước khi dùng
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      
       # ----- STEP 1: Xác định danh sách devices với priority -----
       - name: Set device matrix with priority order
         id: set-device-matrix                              # ID để tham chiếu trong outputs
@@ -116,34 +120,34 @@ jobs:
             # device-pi có priority 1 (cao nhất) -> deploy trước
             # device-tuan priority 2 -> deploy sau
             # device-huong priority 3 -> deploy cuối
-            MATRIX='[
-              {"device_id":"device-pi","tenant_id":"ota","priority":1},
-              {"device_id":"device-tuan","tenant_id":"ota","priority":2},
-              {"device_id":"device-huong","tenant_id":"ota1","priority":3}
-            ]'
+            # QUAN TRỌNG: JSON trên 1 dòng, không có khoảng trắng và xuống dòng
+            MATRIX='[{"device_id":"device-pi","tenant_id":"ota","priority":1},{"device_id":"device-tuan","tenant_id":"ota","priority":2},{"device_id":"device-huong","tenant_id":"ota1","priority":3}]'
           elif [ "$TARGET" == "device-tuan" ]; then
             # Chỉ deploy lên device-tuan
-            MATRIX='[
-              {"device_id":"device-tuan","tenant_id":"ota","priority":1}
-            ]'
+            MATRIX='[{"device_id":"device-tuan","tenant_id":"ota","priority":1}]'
           elif [ "$TARGET" == "device-huong" ]; then
             # Chỉ deploy lên device-huong
-            MATRIX='[
-              {"device_id":"device-huong","tenant_id":"ota1","priority":1}
-            ]'
+            MATRIX='[{"device_id":"device-huong","tenant_id":"ota1","priority":1}]'
           elif [ "$TARGET" == "device-pi" ]; then
             # Chỉ deploy lên device-pi
-            MATRIX='[
-              {"device_id":"device-pi","tenant_id":"ota","priority":1}
-            ]'
+            MATRIX='[{"device_id":"device-pi","tenant_id":"ota","priority":1}]'
           else
             # Nếu target không hợp lệ, báo lỗi và thoát
             echo "Unknown target device: $TARGET"
             exit 1
           fi
           
-          # Lưu matrix vào GITHUB_OUTPUT để job sau có thể dùng
-          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          # Validate JSON
+          echo "$MATRIX" | jq . > /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "Invalid JSON format"
+            exit 1
+          fi
+          
+          # Sử dụng delimiter để output JSON an toàn (tránh lỗi format)
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$MATRIX" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
           
           # In ra màn hình để debug
           echo "Device deployment order:"
@@ -154,7 +158,7 @@ jobs:
         id: build-images-list
         run: |
           # Khởi tạo JSON array rỗng
-          IMAGES_JSON="[]"
+          IMAGES_JSON='[]'
           # Lấy tag từ input (mặc định là latest)
           TAG="${{ inputs.image_tag }}"
           
@@ -173,8 +177,8 @@ jobs:
               --arg full "$FULL_IMAGE" \
               --arg image "$IMAGE_NAME" \
               --arg tag "$TAG" \
-              --arg base "$IMAGE_BASE" \
-              '. += [{"full": $full, "image": $image, "tag": $tag, "name": $base}]')
+              --arg name "$IMAGE_BASE" \
+              '. + [{"full": $full, "image": $image, "tag": $tag, "name": $name}]')
           }
           
           # ===== KIỂM TRA TỪNG CHECKBOX =====
@@ -188,21 +192,6 @@ jobs:
           if [ "${{ inputs.image_nginx }}" == "true" ]; then
             add_image "docker.io/library/nginx"
             echo "✓ Selected: Nginx"
-          fi
-          
-          if [ "${{ inputs.image_redis }}" == "true" ]; then
-            add_image "docker.io/library/redis"
-            echo "✓ Selected: Redis"
-          fi
-          
-          if [ "${{ inputs.image_mysql }}" == "true" ]; then
-            add_image "docker.io/library/mysql"
-            echo "✓ Selected: MySQL"
-          fi
-          
-          if [ "${{ inputs.image_postgres }}" == "true" ]; then
-            add_image "docker.io/library/postgres"
-            echo "✓ Selected: PostgreSQL"
           fi
           
           if [ "${{ inputs.image_hello_world }}" == "true" ]; then
@@ -240,8 +229,8 @@ jobs:
                   --arg full "$CUSTOM_FULL" \
                   --arg image "$CUSTOM_IMAGE" \
                   --arg tag "$CUSTOM_TAG" \
-                  --arg base "$CUSTOM_BASE" \
-                  '. += [{"full": $full, "image": $image, "tag": $tag, "name": $base}]')
+                  --arg name "$CUSTOM_BASE" \
+                  '. + [{"full": $full, "image": $image, "tag": $tag, "name": $name}]')
                 
                 echo "✓ Custom: $CUSTOM_FULL"
               fi
@@ -256,8 +245,10 @@ jobs:
             exit 1  # Dừng job vì không có image nào để deploy
           fi
           
-          # Lưu danh sách images vào GITHUB_OUTPUT
-          echo "images=${IMAGES_JSON}" >> "$GITHUB_OUTPUT"
+          # Sử dụng delimiter để output JSON an toàn
+          echo "images<<EOF" >> $GITHUB_OUTPUT
+          echo "$IMAGES_JSON" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
           
           # In danh sách images đã chọn ra màn hình để debug
           echo ""
@@ -321,7 +312,7 @@ jobs:
           
           # ===== TẠO PAYLOAD THEO DITTO PROTOCOL =====
           # Payload này sẽ được gửi đến edge device qua MQTT
-          PAYLOAD=$(cat <<EOF
+          cat > /tmp/payload.json << EOF
           {
             "topic": "${TENANT_ID}/${DEVICE_ID}/things/live/messages/apply",
             "headers": {
@@ -355,16 +346,20 @@ jobs:
             }
           }
           EOF
-          )
           
-          # Lưu payload vào file để publish
-          echo "$PAYLOAD" > /tmp/payload.json
+          # Validate JSON
+          jq . /tmp/payload.json > /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "❌ Invalid payload JSON"
+            cat /tmp/payload.json
+            exit 1
+          fi
           
           # ===== LƯU OUTPUTS CHO SUMMARY =====
-          echo "container_name=${CONTAINER_NAME}" >> "$GITHUB_OUTPUT"
-          echo "mqtt_topic=${MQTT_TOPIC}" >> "$GITHUB_OUTPUT"
-          echo "final_image=${{ matrix.image.full }}" >> "$GITHUB_OUTPUT"
-          echo "target=${DEVICE_ID}@${TENANT_ID}" >> "$GITHUB_OUTPUT"
+          echo "container_name=${CONTAINER_NAME}" >> $GITHUB_OUTPUT
+          echo "mqtt_topic=${MQTT_TOPIC}" >> $GITHUB_OUTPUT
+          echo "final_image=${{ matrix.image.full }}" >> $GITHUB_OUTPUT
+          echo "target=${DEVICE_ID}@${TENANT_ID}" >> $GITHUB_OUTPUT
           
           # ===== LOG DEPLOYMENT INFO =====
           echo "=========================================="
@@ -376,7 +371,7 @@ jobs:
           echo "=========================================="
           
           # ===== PUBLISH MQTT MESSAGE =====
-          echo "📡 Publishing to MQTT broker..."
+          echo "📡 Publishing to MQTT broker at ${{ env.MQTT_HOST }}:1883..."
           mosquitto_pub \
             -h "${{ env.MQTT_HOST }}" \                  # MQTT broker host
             -p 1883 \                                     # MQTT port
@@ -427,6 +422,10 @@ jobs:
     if: always()                                         # Luôn chạy dù có job fail
     
     steps:
+      # Cài đặt jq cho final-summary
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      
       - name: Generate final deployment summary
         run: |
           # Tạo summary tổng hợp
@@ -442,14 +441,14 @@ jobs:
           
           # Phần danh sách images đã deploy
           echo "## 📋 Deployed Images" >> $GITHUB_STEP_SUMMARY
-          # Dùng jq để parse JSON và hiển thị từng image
-          echo '${{ needs.prepare.outputs.images }}' | jq -r '.[] | "- **\(.name)**: `\(.full)`"' >> $GITHUB_STEP_SUMMARY
+          # Dùng jq để parse JSON và hiển thị từng image (thêm 2>/dev/null để tránh lỗi)
+          echo '${{ needs.prepare.outputs.images }}' | jq -r '.[] | "- **\(.name)**: `\(.full)`"' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No images found" >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Phần thứ tự deploy devices (theo priority)
           echo "## 🖥️ Device Deployment Order" >> $GITHUB_STEP_SUMMARY
-          echo '${{ needs.prepare.outputs.device_matrix }}' | jq -r '.[] | "- **Priority \(.priority)**: `\(.device_id)@\(.tenant_id)`"' >> $GITHUB_STEP_SUMMARY
+          echo '${{ needs.prepare.outputs.device_matrix }}' | jq -r '.[] | "- **Priority \(.priority)**: `\(.device_id)@\(.tenant_id)`"' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No devices found" >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
           
