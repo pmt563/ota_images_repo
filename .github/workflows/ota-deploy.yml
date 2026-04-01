@@ -60,10 +60,10 @@ on:
       
       # ===== PHẦN 3: CẤU HÌNH CONTAINER =====
       container_name:
-        description: 'Container name on edge device (leave blank for auto-detect with unique suffix)'
+        description: 'Container name prefix (leave blank for auto-detect)'
         required: false
         type: string
-        default: ''                                        # Để trống để auto-detect với suffix unique
+        default: ''                                        # Để trống để auto-detect
       
       # ===== PHẦN 4: CẤU HÌNH DEPLOYMENT =====
       deployment_mode:
@@ -265,22 +265,18 @@ jobs:
   # ============================================
   # JOB 2: SEND-OTA-COMMANDS - Gửi lệnh OTA qua MQTT
   # ============================================
-  # Job này chạy sau prepare, thực hiện deploy từng image lên từng device
-  # Sử dụng matrix strategy để tạo N x M jobs (số device × số image)
+  # CẢI TIẾN: Gửi 1 lệnh duy nhất cho mỗi device chứa TẤT CẢ images
+  # Sử dụng matrix chỉ cho device, KHÔNG cho image
   # ============================================
   send-ota-commands:
     needs: prepare                                        # Chỉ chạy sau khi prepare hoàn thành
     runs-on: ubuntu-latest
     
-    # MATRIX STRATEGY: Tạo jobs cho mọi cặp (device, image)
-    # Ví dụ: 3 devices × 2 images = 6 jobs chạy song song
+    # CHỈ matrix cho device, không matrix cho image
     strategy:
       matrix:
         device: ${{ fromJson(needs.prepare.outputs.device_matrix) }}   # Lấy danh sách devices từ job prepare
-        image: ${{ fromJson(needs.prepare.outputs.images) }}           # Lấy danh sách images từ job prepare
       fail-fast: false                                   # Nếu 1 job fail, các job khác vẫn tiếp tục
-      # max-parallel: kiểm soát số job chạy đồng thời
-      # sequential: chạy 1 job mỗi lần, parallel: chạy tất cả cùng lúc
       max-parallel: ${{ inputs.deployment_mode == 'sequential' && 1 || 999 }}
     
     steps:
@@ -288,61 +284,37 @@ jobs:
       - name: Install MQTT client and jq
         run: sudo apt-get update && sudo apt-get install -y mosquitto-clients jq
       
-      # ----- STEP 2: Deploy image lên device -----
-      - name: "Deploy ${{ matrix.image.name }} (${{ matrix.image.full }}) to ${{ matrix.device.device_id }}"
-        id: payload                                       # ID để tham chiếu outputs
+      # ----- STEP 2: Deploy TẤT CẢ images lên device trong 1 lệnh -----
+      - name: "Deploy all images to ${{ matrix.device.device_id }}"
+        id: batch-deploy
         run: |
-          # ===== XÁC ĐỊNH TÊN CONTAINER DUY NHẤT =====
-          # Tạo container name duy nhất để tránh ghi đè khi deploy nhiều images
-          # Nếu user chỉ định container name thì dùng user input
-          # Nếu không, tự động tạo container name unique với suffix là timestamp hoặc image name
+          # ===== LẤY THÔNG TIN DEVICE =====
+          TENANT_ID="${{ matrix.device.tenant_id }}"
+          DEVICE_ID="${{ matrix.device.device_id }}"
+          PRIORITY="${{ matrix.device.priority }}"
           
-          if [ -n "${{ inputs.container_name }}" ]; then
-            # User đã chỉ định container name cụ thể
-            CONTAINER_NAME="${{ inputs.container_name }}"
-            echo "⚠️  Using user-specified container name: ${CONTAINER_NAME}"
-            echo "⚠️  Warning: If deploying multiple images with same name, they will overwrite each other!"
-          else
-            # Auto-detect với cơ chế unique
-            if [ "${{ inputs.use_unique_container_name }}" == "true" ]; then
-              # Tạo container name duy nhất: <image_name>_<device_id>_<short_id>
-              # Lấy tên image base (phần cuối cùng sau dấu /)
-              IMAGE_BASE="${{ matrix.image.name }}"
-              # Lấy device ID ngắn gọn
-              DEVICE_SHORT="${{ matrix.device.device_id }}"
-              # Tạo short ID từ run_id và image index (đảm bảo unique)
-              SHORT_ID="${GITHUB_RUN_ID: -6}-${{ strategy.job-index }}"
-              
-              CONTAINER_NAME="${IMAGE_BASE}_${DEVICE_SHORT}_${SHORT_ID}"
-              echo "✓ Generated unique container name: ${CONTAINER_NAME}"
-            else
-              # Cách cũ: chỉ dùng tên image (có thể bị ghi đè)
-              CONTAINER_NAME="${{ matrix.image.name }}"
-              echo "⚠️  Using simple container name: ${CONTAINER_NAME} (may overwrite existing containers)"
-            fi
-          fi
-          
-          # Thay thế các ký tự đặc biệt không hợp lệ trong container name
-          CONTAINER_NAME=$(echo "$CONTAINER_NAME" | sed 's/[^a-zA-Z0-9_.-]/-/g')
-          
-          # Lấy thông tin từ matrix
-          TENANT_ID="${{ matrix.device.tenant_id }}"     # Tenant của device
-          DEVICE_ID="${{ matrix.device.device_id }}"     # ID của device
-          PRIORITY="${{ matrix.device.priority }}"       # Priority của device (để log)
-          
-          # ===== TẠO CORRELATION ID =====
-          # Correlation ID dùng để trace request từ GitHub đến edge device
-          # Format: gha-<run_id>-<run_number>-<device>-<container>
-          CORRELATION_ID="gha-${{ github.run_id }}-${{ github.run_number }}-${DEVICE_ID}-${CONTAINER_NAME}"
-          ACTIVITY_ID="${CORRELATION_ID}"                # Activity ID cho Update Manager
-          
-          # ===== TẠO MQTT TOPIC =====
-          # Topic format: command///req/<correlation_id>/um
-          # Suite Connector sẽ route message đến Update Manager
+          # ===== TẠO UNIQUE ID CHO BATCH DEPLOYMENT =====
+          RUN_ID="${GITHUB_RUN_ID: -6}"
+          BATCH_ID="batch-${RUN_ID}"
+          CORRELATION_ID="gha-${GITHUB_RUN_ID}-${GITHUB_RUN_NUMBER}-${DEVICE_ID}-${BATCH_ID}"
           MQTT_TOPIC="command///req/${CORRELATION_ID}/um"
           
-          # ===== TẠO PAYLOAD THEO DITTO PROTOCOL =====
-          # Payload này sẽ được gửi đến edge device qua MQTT
+          # ===== QUAN TRỌNG: GOM TẤT CẢ IMAGES VÀO 1 COMPONENTS ARRAY =====
+          # Lấy danh sách images từ prepare job
+          IMAGES_JSON='${{ needs.prepare.outputs.images }}'
+          IMAGE_COUNT=$(echo "$IMAGES_JSON" | jq 'length')
+          
+          # Dùng jq để tạo components array từ tất cả images
+          # Mỗi image sẽ thành 1 component trong desired state
+          COMPONENTS_JSON=$(echo "$IMAGES_JSON" | jq -c --arg device "$DEVICE_ID" --arg run "$RUN_ID" '
+            map({
+              id: if $device != "" then "\(.name)_\($device)_\($run)" else "\(.name)_\($run)" end,
+              version: .tag,
+              config: [{key: "image", value: .full}]
+            })
+          ')
+          
+          # ===== TẠO PAYLOAD VỚI TẤT CẢ COMPONENTS =====
           cat > /tmp/payload.json << EOF
           {
             "topic": "${TENANT_ID}/${DEVICE_ID}/things/live/messages/apply",
@@ -353,24 +325,13 @@ jobs:
             },
             "path": "/features/UpdateManager/inbox/messages/apply",
             "value": {
-              "activityId": "${ACTIVITY_ID}",
+              "activityId": "${CORRELATION_ID}",
               "desiredState": {
                 "domains": [
                   {
                     "id": "containers",
                     "config": [],
-                    "components": [
-                      {
-                        "id": "${CONTAINER_NAME}",
-                        "version": "${{ matrix.image.tag }}",
-                        "config": [
-                          {
-                            "key": "image",
-                            "value": "${{ matrix.image.full }}"
-                          }
-                        ]
-                      }
-                    ]
+                    "components": ${COMPONENTS_JSON}
                   }
                 ]
               }
@@ -386,24 +347,17 @@ jobs:
             exit 1
           fi
           
-          # ===== LƯU OUTPUTS CHO SUMMARY =====
-          echo "container_name=${CONTAINER_NAME}" >> $GITHUB_OUTPUT
-          echo "mqtt_topic=${MQTT_TOPIC}" >> $GITHUB_OUTPUT
-          echo "final_image=${{ matrix.image.full }}" >> $GITHUB_OUTPUT
-          echo "target=${DEVICE_ID}@${TENANT_ID}" >> $GITHUB_OUTPUT
-          
           # ===== LOG DEPLOYMENT INFO =====
           echo "=========================================="
-          echo "📦 Deploying: ${{ matrix.image.name }}"
-          echo "   Image: ${{ matrix.image.full }}"
-          echo "   Device: ${DEVICE_ID} (Priority: ${PRIORITY})"
-          echo "   Container: ${CONTAINER_NAME}"
-          echo "   Topic: ${MQTT_TOPIC}"
+          echo "📦 BATCH DEPLOYMENT to: ${DEVICE_ID}"
+          echo "   Total images: ${IMAGE_COUNT}"
+          echo "   Correlation ID: ${CORRELATION_ID}"
+          echo "   Components:"
+          echo "$COMPONENTS_JSON" | jq -r '.[] | "     - \(.id): \(.config[0].value)"'
           echo "=========================================="
           
           # ===== PUBLISH MQTT MESSAGE =====
-          # QUAN TRỌNG: Không có dấu \ ở cuối dòng
-          echo "📡 Publishing to MQTT broker at ${{ env.MQTT_HOST }}:1883..."
+          echo "📡 Publishing batch deployment to MQTT broker at ${{ env.MQTT_HOST }}:1883..."
           mosquitto_pub \
             -h "${{ env.MQTT_HOST }}" \
             -p 1883 \
@@ -414,16 +368,22 @@ jobs:
           
           # Kiểm tra kết quả publish
           if [ $? -eq 0 ]; then
-            echo "✅ Successfully deployed to ${DEVICE_ID}"
+            echo "✅ Batch deployment sent to ${DEVICE_ID}"
           else
-            echo "❌ Failed to deploy to ${DEVICE_ID}"
+            echo "❌ Failed to send batch deployment to ${DEVICE_ID}"
             exit 1
           fi
           
+          # ===== LƯU OUTPUTS CHO SUMMARY =====
+          echo "batch_id=${BATCH_ID}" >> $GITHUB_OUTPUT
+          echo "correlation_id=${CORRELATION_ID}" >> $GITHUB_OUTPUT
+          echo "mqtt_topic=${MQTT_TOPIC}" >> $GITHUB_OUTPUT
+          echo "image_count=${IMAGE_COUNT}" >> $GITHUB_OUTPUT
+          echo "target=${DEVICE_ID}@${TENANT_ID}" >> $GITHUB_OUTPUT
+          
           # ===== SEQUENTIAL MODE DELAY =====
-          # Nếu chọn sequential mode, chờ 5 giây trước khi deploy tiếp theo
           if [ "${{ inputs.deployment_mode }}" == "sequential" ]; then
-            echo "⏱️  Sequential mode: Waiting 5 seconds..."
+            echo "⏱️  Sequential mode: Waiting 5 seconds before next device..."
             sleep 5
           fi
       
@@ -432,13 +392,14 @@ jobs:
         if: always()                                      # Luôn chạy dù job thành công hay fail
         run: |
           # Ghi vào GITHUB_STEP_SUMMARY để hiển thị trong GitHub Actions UI
-          echo "## 📦 OTA Deploy: ${{ matrix.image.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Batch OTA Deploy to ${{ matrix.device.device_id }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Image** | \`${{ steps.payload.outputs.final_image }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Container** | \`${{ steps.payload.outputs.container_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Target** | \`${{ steps.payload.outputs.target }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target** | \`${{ steps.batch-deploy.outputs.target }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Batch ID** | \`${{ steps.batch-deploy.outputs.batch_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Images Count** | \`${{ steps.batch-deploy.outputs.image_count }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **MQTT Topic** | \`${{ steps.batch-deploy.outputs.mqtt_topic }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Mode** | ${{ inputs.deployment_mode }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -469,12 +430,11 @@ jobs:
           echo "- **Target**: ${{ inputs.target_device }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Mode**: ${{ inputs.deployment_mode }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Tag**: ${{ inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Unique Container Names**: ${{ inputs.use_unique_container_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deployment Type**: **Batch** (all images in one command)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Phần danh sách images đã deploy
           echo "## 📋 Deployed Images" >> $GITHUB_STEP_SUMMARY
-          # Dùng jq để parse JSON và hiển thị từng image (thêm 2>/dev/null để tránh lỗi)
           echo '${{ needs.prepare.outputs.images }}' | jq -r '.[] | "- **\(.name)**: `\(.full)`"' >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo "No images found" >> $GITHUB_STEP_SUMMARY
           
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -487,6 +447,8 @@ jobs:
           
           # Phần trạng thái
           echo "## 📊 Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All images deployed in **BATCH mode** - no conflicts between containers" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           echo "Check the individual job logs above for detailed results." >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
