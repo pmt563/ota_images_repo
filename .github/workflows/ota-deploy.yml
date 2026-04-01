@@ -1,130 +1,326 @@
+# ============================================
+# OTA Deploy via MQTT - GitHub Actions Workflow
+# ============================================
+# Mục đích: Deploy container images từ GitHub Container Registry hoặc Docker Hub
+# lên các edge devices thông qua MQTT broker
+# ============================================
+
 name: OTA Deploy via MQTT
 
+# Trigger workflow khi chạy thủ công từ GitHub UI
 on:
   workflow_dispatch:
     inputs:
-      image:
-        description: 'Select container image from GHCR packages'
-        required: true
-        type: choice
-        options:
-          - ghcr.io/pmt563/vs_bsr_zonal_x86
-          - docker.io/library/nginx
-          - docker.io/library/hello-world
-      version:
-        description: 'Image version/tag (leave blank to auto-detect latest)'
+      # ===== PHẦN 1: CHỌN IMAGES =====
+      # Sử dụng boolean (checkbox) cho mỗi image thường dùng
+      # Giúp giao diện đẹp và dễ sử dụng hơn
+      
+      image_zonal:
+        description: 'Zonal Service (vs_bsr_zonal_x86)'  # Mô tả hiển thị trên UI
+        required: false                                   # Không bắt buộc chọn
+        type: boolean                                     # Kiểu checkbox
+        default: false                                    # Mặc định không chọn
+        
+      image_nginx:
+        description: 'Nginx Web Server'
+        required: false
+        type: boolean
+        default: false
+        
+      image_hello_world:
+        description: 'Hello World Test'
+        required: false
+        type: boolean
+        default: false
+      
+      # Input cho phép nhập image tùy chỉnh (không có trong danh sách checkbox)
+      custom_image:
+        description: 'Custom image (format: image:tag) - one per line if multiple'
+        required: false                                    # Không bắt buộc
+        type: string                                       # Kiểu text box
+        default: ''                                        # Mặc định rỗng
+      
+      # Tag chung cho tất cả images (có thể override ở custom image)
+      image_tag:
+        description: 'Image tag (applies to all selected images, leave blank for latest)'
         required: false
         type: string
-        default: ''
+        default: 'latest'                                  # Mặc định là latest
+      
+      # ===== PHẦN 2: CHỌN THIẾT BỊ ĐÍCH =====
       target_device:
         description: 'Target edge device to deploy to'
-        required: true
-        type: choice
+        required: true                                     # Bắt buộc phải chọn
+        type: choice                                       # Kiểu dropdown
         options:
-          - all-devices
-          - device-tuan
-          - device-huong
-          - device-pi
+          - all-devices                                    # Deploy lên tất cả devices
+          - device-tuan                                    # Chỉ deploy lên device-tuan
+          - device-huong                                   # Chỉ deploy lên device-huong
+          - device-pi                                      # Chỉ deploy lên device-pi
+      
+      # ===== PHẦN 3: CẤU HÌNH CONTAINER =====
       container_name:
-        description: 'Container name on edge device (default: derived from image)'
+        description: 'Container name on edge device (leave blank for auto-detect)'
         required: false
         type: string
+        default: ''                                        # Để trống để auto-detect
+      
+      # ===== PHẦN 4: CẤU HÌNH DEPLOYMENT =====
+      deployment_mode:
+        description: 'Deployment mode'
+        required: false
+        type: choice
+        options:
+          - parallel                                        # Deploy đồng thời tất cả
+          - sequential                                      # Deploy tuần tự từng cái
+        default: 'parallel'                                # Mặc định chạy song song
 
+# ===== BIẾN MÔI TRƯỜNG =====
+# Lưu trữ thông tin kết nối MQTT broker
 env:
-  MQTT_HOST: ${{ secrets.GCP_VM_HOST }}
-  MQTT_USER: github-ci
-  MQTT_PASS: ${{ secrets.MQTT_CI_PASSWORD }}
+  MQTT_HOST: ${{ secrets.GCP_VM_HOST }}                    # Địa chỉ MQTT broker (lưu trong secrets)
+  MQTT_USER: github-ci                                     # Username kết nối MQTT
+  MQTT_PASS: ${{ secrets.MQTT_CI_PASSWORD }}              # Password kết nối MQTT (lưu trong secrets)
 
+# ============================================
+# JOB 1: PREPARE - Chuẩn bị dữ liệu trước khi deploy
+# ============================================
+# Job này chạy đầu tiên, có nhiệm vụ:
+# 1. Xác định danh sách devices cần deploy (với priority)
+# 2. Xác định danh sách images cần deploy
+# 3. Output các danh sách này cho job sau sử dụng
+# ============================================
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest                                 # Chạy trên Ubuntu mới nhất
+    
+    # Outputs để truyền dữ liệu sang job send-ota-commands
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      version: ${{ steps.detect.outputs.version }}
+      device_matrix: ${{ steps.set-device-matrix.outputs.matrix }}   # Danh sách devices
+      images: ${{ steps.build-images-list.outputs.images }}          # Danh sách images
+    
     steps:
-      - name: Set device matrix
-        id: set-matrix
+      # ----- STEP 1: Xác định danh sách devices với priority -----
+      - name: Set device matrix with priority order
+        id: set-device-matrix                              # ID để tham chiếu trong outputs
         run: |
+          # Lấy target device từ input
           TARGET="${{ inputs.target_device }}"
-
+          
+          # Dựa vào target device để tạo JSON matrix
+          # Mỗi device có: device_id (tên thiết bị), tenant_id (tenant của thiết bị), priority (độ ưu tiên)
+          # Priority càng nhỏ thì deploy càng trước
+          
           if [ "$TARGET" == "all-devices" ]; then
-            MATRIX='[{"device_id":"device-tuan","tenant_id":"ota"},{"device_id":"device-huong","tenant_id":"ota1"},{"device_id":"device-pi","tenant_id":"ota"}]'
+            # Deploy lên tất cả devices với priority đã định nghĩa
+            # device-pi có priority 1 (cao nhất) -> deploy trước
+            # device-tuan priority 2 -> deploy sau
+            # device-huong priority 3 -> deploy cuối
+            MATRIX='[
+              {"device_id":"device-pi","tenant_id":"ota","priority":1},
+              {"device_id":"device-tuan","tenant_id":"ota","priority":2},
+              {"device_id":"device-huong","tenant_id":"ota1","priority":3}
+            ]'
           elif [ "$TARGET" == "device-tuan" ]; then
-            MATRIX='[{"device_id":"device-tuan","tenant_id":"ota"}]'
+            # Chỉ deploy lên device-tuan
+            MATRIX='[
+              {"device_id":"device-tuan","tenant_id":"ota","priority":1}
+            ]'
           elif [ "$TARGET" == "device-huong" ]; then
-            MATRIX='[{"device_id":"device-huong","tenant_id":"ota1"}]'
+            # Chỉ deploy lên device-huong
+            MATRIX='[
+              {"device_id":"device-huong","tenant_id":"ota1","priority":1}
+            ]'
           elif [ "$TARGET" == "device-pi" ]; then
-            MATRIX='[{"device_id":"device-pi","tenant_id":"ota"}]'
+            # Chỉ deploy lên device-pi
+            MATRIX='[
+              {"device_id":"device-pi","tenant_id":"ota","priority":1}
+            ]'
           else
+            # Nếu target không hợp lệ, báo lỗi và thoát
             echo "Unknown target device: $TARGET"
             exit 1
           fi
-
+          
+          # Lưu matrix vào GITHUB_OUTPUT để job sau có thể dùng
           echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
-          echo "Targets: ${MATRIX}"
-
-      - name: Install skopeo
-        run: sudo apt-get update && sudo apt-get install -y skopeo jq
-
-      - name: Auto-detect latest image version
-        id: detect
+          
+          # In ra màn hình để debug
+          echo "Device deployment order:"
+          echo "$MATRIX" | jq -r '.[] | "  Priority \(.priority): \(.device_id) (tenant: \(.tenant_id))"'
+      
+      # ----- STEP 2: Xây dựng danh sách images từ checkbox và custom input -----
+      - name: Build images list from checkboxes and custom input
+        id: build-images-list
         run: |
-          VERSION="${{ inputs.version }}"
-          IMAGE="${{ inputs.image }}"
-
-          if [ -z "$VERSION" ] || [ "$VERSION" == "latest" ]; then
-            echo "Auto-detecting latest version for $IMAGE..."
-
-            if [[ "$IMAGE" == ghcr.io/* ]]; then
-              TAGS_JSON=$(skopeo list-tags --creds ${{ github.actor }}:${{ secrets.GITHUB_TOKEN }} docker://$IMAGE)
-            else
-              TAGS_JSON=$(skopeo list-tags docker://$IMAGE)
-            fi
-
-            LATEST_TAG=$(echo "$TAGS_JSON" | jq -r '.Tags[]' | grep -v -E 'latest|^v?0\.0\.0' | sort -V | tail -n 1)
-
-            if [ -n "$LATEST_TAG" ]; then
-              VERSION=$LATEST_TAG
-              echo "Detected latest version: $VERSION"
-            else
-              echo "No semantic version found, falling back to 'latest'"
-              VERSION="latest"
-            fi
-          else
-            echo "Using provided version: $VERSION"
+          # Khởi tạo JSON array rỗng
+          IMAGES_JSON="[]"
+          # Lấy tag từ input (mặc định là latest)
+          TAG="${{ inputs.image_tag }}"
+          
+          # Định nghĩa function để thêm image vào danh sách
+          # Input: IMAGE_NAME (ví dụ: docker.io/library/nginx)
+          # Output: Thêm object vào IMAGES_JSON
+          add_image() {
+            local IMAGE_NAME="$1"
+            # Tạo full image name với tag: nginx:latest
+            local FULL_IMAGE="${IMAGE_NAME}:${TAG}"
+            # Lấy tên base (phần cuối của image path): nginx
+            local IMAGE_BASE=$(echo "$IMAGE_NAME" | awk -F'/' '{print $NF}')
+            
+            # Sử dụng jq để thêm object vào JSON array
+            IMAGES_JSON=$(echo "$IMAGES_JSON" | jq \
+              --arg full "$FULL_IMAGE" \
+              --arg image "$IMAGE_NAME" \
+              --arg tag "$TAG" \
+              --arg base "$IMAGE_BASE" \
+              '. += [{"full": $full, "image": $image, "tag": $tag, "name": $base}]')
+          }
+          
+          # ===== KIỂM TRA TỪNG CHECKBOX =====
+          # Nếu checkbox được tick (== true) thì thêm image tương ứng
+          
+          if [ "${{ inputs.image_zonal }}" == "true" ]; then
+            add_image "ghcr.io/pmt563/vs_bsr_zonal_x86"
+            echo "✓ Selected: Zonal Service"
           fi
+          
+          if [ "${{ inputs.image_nginx }}" == "true" ]; then
+            add_image "docker.io/library/nginx"
+            echo "✓ Selected: Nginx"
+          fi
+          
+          if [ "${{ inputs.image_redis }}" == "true" ]; then
+            add_image "docker.io/library/redis"
+            echo "✓ Selected: Redis"
+          fi
+          
+          if [ "${{ inputs.image_mysql }}" == "true" ]; then
+            add_image "docker.io/library/mysql"
+            echo "✓ Selected: MySQL"
+          fi
+          
+          if [ "${{ inputs.image_postgres }}" == "true" ]; then
+            add_image "docker.io/library/postgres"
+            echo "✓ Selected: PostgreSQL"
+          fi
+          
+          if [ "${{ inputs.image_hello_world }}" == "true" ]; then
+            add_image "docker.io/library/hello-world"
+            echo "✓ Selected: Hello World"
+          fi
+          
+          # ===== XỬ LÝ CUSTOM IMAGES =====
+          # Nếu có nhập custom image (không rỗng)
+          if [ -n "${{ inputs.custom_image }}" ]; then
+            echo "Processing custom images..."
+            # Đọc từng dòng (mỗi dòng là một image)
+            echo "${{ inputs.custom_image }}" | grep -v '^$' | while IFS= read -r line; do
+              # Xóa khoảng trắng đầu và cuối dòng
+              line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
+              if [ -n "$line" ]; then
+                # Kiểm tra xem dòng có chứa tag (dấu :) không
+                if [[ "$line" == *":"* ]]; then
+                  # Có tag riêng: tách image và tag
+                  CUSTOM_IMAGE="${line%:*}"    # Phần trước dấu :
+                  CUSTOM_TAG="${line#*:}"      # Phần sau dấu :
+                  CUSTOM_FULL="$line"          # Full image với tag
+                else
+                  # Không có tag: dùng tag chung
+                  CUSTOM_IMAGE="$line"
+                  CUSTOM_TAG="$TAG"
+                  CUSTOM_FULL="${line}:${TAG}"
+                fi
+                
+                # Lấy tên base (phần cuối của image path)
+                CUSTOM_BASE=$(echo "$CUSTOM_IMAGE" | awk -F'/' '{print $NF}')
+                
+                # Thêm vào JSON array
+                IMAGES_JSON=$(echo "$IMAGES_JSON" | jq \
+                  --arg full "$CUSTOM_FULL" \
+                  --arg image "$CUSTOM_IMAGE" \
+                  --arg tag "$CUSTOM_TAG" \
+                  --arg base "$CUSTOM_BASE" \
+                  '. += [{"full": $full, "image": $image, "tag": $tag, "name": $base}]')
+                
+                echo "✓ Custom: $CUSTOM_FULL"
+              fi
+            done
+          fi
+          
+          # ===== VALIDATION: KIỂM TRA CÓ ÍT NHẤT 1 IMAGE =====
+          IMAGE_COUNT=$(echo "$IMAGES_JSON" | jq 'length')
+          if [ "$IMAGE_COUNT" -eq 0 ]; then
+            echo "❌ Error: No images selected!"
+            echo "Please select at least one image from the list or provide a custom image."
+            exit 1  # Dừng job vì không có image nào để deploy
+          fi
+          
+          # Lưu danh sách images vào GITHUB_OUTPUT
+          echo "images=${IMAGES_JSON}" >> "$GITHUB_OUTPUT"
+          
+          # In danh sách images đã chọn ra màn hình để debug
+          echo ""
+          echo "=== Selected Images ($IMAGE_COUNT) ==="
+          echo "$IMAGES_JSON" | jq -r '.[] | "  - \(.full) (container: \(.name))"'
 
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-  send-ota-command:
-    needs: prepare
+  # ============================================
+  # JOB 2: SEND-OTA-COMMANDS - Gửi lệnh OTA qua MQTT
+  # ============================================
+  # Job này chạy sau prepare, thực hiện deploy từng image lên từng device
+  # Sử dụng matrix strategy để tạo N x M jobs (số device × số image)
+  # ============================================
+  send-ota-commands:
+    needs: prepare                                        # Chỉ chạy sau khi prepare hoàn thành
     runs-on: ubuntu-latest
+    
+    # MATRIX STRATEGY: Tạo jobs cho mọi cặp (device, image)
+    # Ví dụ: 3 devices × 2 images = 6 jobs chạy song song
     strategy:
       matrix:
-        target: ${{ fromJson(needs.prepare.outputs.matrix) }}
-      fail-fast: false
+        device: ${{ fromJson(needs.prepare.outputs.device_matrix) }}   # Lấy danh sách devices từ job prepare
+        image: ${{ fromJson(needs.prepare.outputs.images) }}           # Lấy danh sách images từ job prepare
+      fail-fast: false                                   # Nếu 1 job fail, các job khác vẫn tiếp tục
+      # max-parallel: kiểm soát số job chạy đồng thời
+      # sequential: chạy 1 job mỗi lần, parallel: chạy tất cả cùng lúc
+      max-parallel: ${{ inputs.deployment_mode == 'sequential' && 1 || 999 }}
+    
     steps:
-      - name: Install MQTT client
-        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients
-
-      - name: "Deploy to ${{ matrix.target.device_id }}"
-        id: payload
+      # ----- STEP 1: Cài đặt MQTT client và jq -----
+      - name: Install MQTT client and jq
+        run: sudo apt-get update && sudo apt-get install -y mosquitto-clients jq
+      
+      # ----- STEP 2: Deploy image lên device -----
+      - name: "Deploy ${{ matrix.image.name }} (${{ matrix.image.full }}) to ${{ matrix.device.device_id }}"
+        id: payload                                       # ID để tham chiếu outputs
         run: |
+          # ===== XÁC ĐỊNH TÊN CONTAINER =====
+          # Nếu user nhập container name thì dùng, không thì auto-detect từ image
           CONTAINER_NAME="${{ inputs.container_name }}"
           if [ -z "$CONTAINER_NAME" ]; then
-            CONTAINER_NAME=$(echo "${{ inputs.image }}" | awk -F'/' '{print $NF}')
+            # Lấy tên image (phần cuối cùng sau dấu /)
+            # Ví dụ: docker.io/library/nginx -> nginx
+            CONTAINER_NAME="${{ matrix.image.name }}"
           fi
-
-          DETECTED_VERSION="${{ needs.prepare.outputs.version }}"
-          TENANT_ID="${{ matrix.target.tenant_id }}"
-          DEVICE_ID="${{ matrix.target.device_id }}"
-
-          CORRELATION_ID="gha-${{ github.run_id }}-${{ github.run_number }}-${DEVICE_ID}"
-          ACTIVITY_ID="${CORRELATION_ID}"
-
-          # Subject MUST be "um" for Suite Connector to route to Update Manager
+          
+          # Lấy thông tin từ matrix
+          TENANT_ID="${{ matrix.device.tenant_id }}"     # Tenant của device
+          DEVICE_ID="${{ matrix.device.device_id }}"     # ID của device
+          PRIORITY="${{ matrix.device.priority }}"       # Priority của device (để log)
+          
+          # ===== TẠO CORRELATION ID =====
+          # Correlation ID dùng để trace request từ GitHub đến edge device
+          # Format: gha-<run_id>-<run_number>-<device>-<container>
+          CORRELATION_ID="gha-${{ github.run_id }}-${{ github.run_number }}-${DEVICE_ID}-${CONTAINER_NAME}"
+          ACTIVITY_ID="${CORRELATION_ID}"                # Activity ID cho Update Manager
+          
+          # ===== TẠO MQTT TOPIC =====
+          # Topic format: command///req/<correlation_id>/um
+          # Suite Connector sẽ route message đến Update Manager
           MQTT_TOPIC="command///req/${CORRELATION_ID}/um"
-
-          # Ditto protocol envelope — topic field routes to the correct device
+          
+          # ===== TẠO PAYLOAD THEO DITTO PROTOCOL =====
+          # Payload này sẽ được gửi đến edge device qua MQTT
           PAYLOAD=$(cat <<EOF
           {
             "topic": "${TENANT_ID}/${DEVICE_ID}/things/live/messages/apply",
@@ -144,11 +340,11 @@ jobs:
                     "components": [
                       {
                         "id": "${CONTAINER_NAME}",
-                        "version": "${DETECTED_VERSION}",
+                        "version": "${{ matrix.image.tag }}",
                         "config": [
                           {
                             "key": "image",
-                            "value": "${{ inputs.image }}:${DETECTED_VERSION}"
+                            "value": "${{ matrix.image.full }}"
                           }
                         ]
                       }
@@ -160,41 +356,106 @@ jobs:
           }
           EOF
           )
-
+          
+          # Lưu payload vào file để publish
+          echo "$PAYLOAD" > /tmp/payload.json
+          
+          # ===== LƯU OUTPUTS CHO SUMMARY =====
           echo "container_name=${CONTAINER_NAME}" >> "$GITHUB_OUTPUT"
           echo "mqtt_topic=${MQTT_TOPIC}" >> "$GITHUB_OUTPUT"
-          echo "final_image=${{ inputs.image }}:${DETECTED_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "final_image=${{ matrix.image.full }}" >> "$GITHUB_OUTPUT"
           echo "target=${DEVICE_ID}@${TENANT_ID}" >> "$GITHUB_OUTPUT"
-
-          echo "$PAYLOAD" > /tmp/payload.json
-
-          echo "Desired State for ${DEVICE_ID}:"
-          cat /tmp/payload.json | python3 -m json.tool
-
-          echo "Publishing to ${{ env.MQTT_HOST }}:1883"
-          echo "Topic: ${MQTT_TOPIC}"
-          echo "Target Device: ${DEVICE_ID} (tenant: ${TENANT_ID})"
-
+          
+          # ===== LOG DEPLOYMENT INFO =====
+          echo "=========================================="
+          echo "📦 Deploying: ${{ matrix.image.name }}"
+          echo "   Image: ${{ matrix.image.full }}"
+          echo "   Device: ${DEVICE_ID} (Priority: ${PRIORITY})"
+          echo "   Container: ${CONTAINER_NAME}"
+          echo "   Topic: ${MQTT_TOPIC}"
+          echo "=========================================="
+          
+          # ===== PUBLISH MQTT MESSAGE =====
+          echo "📡 Publishing to MQTT broker..."
           mosquitto_pub \
-            -h "${{ env.MQTT_HOST }}" \
-            -p 1883 \
-            -u "${{ env.MQTT_USER }}" \
-            -P "${{ env.MQTT_PASS }}" \
-            -t "${MQTT_TOPIC}" \
-            -f /tmp/payload.json
-
-          echo "OTA command published to ${DEVICE_ID}!"
-
+            -h "${{ env.MQTT_HOST }}" \                  # MQTT broker host
+            -p 1883 \                                     # MQTT port
+            -u "${{ env.MQTT_USER }}" \                  # MQTT username
+            -P "${{ env.MQTT_PASS }}" \                  # MQTT password
+            -t "${MQTT_TOPIC}" \                         # MQTT topic
+            -f /tmp/payload.json                         # Payload file
+          
+          # Kiểm tra kết quả publish
+          if [ $? -eq 0 ]; then
+            echo "✅ Successfully deployed to ${DEVICE_ID}"
+          else
+            echo "❌ Failed to deploy to ${DEVICE_ID}"
+            exit 1
+          fi
+          
+          # ===== SEQUENTIAL MODE DELAY =====
+          # Nếu chọn sequential mode, chờ 5 giây trước khi deploy tiếp theo
+          if [ "${{ inputs.deployment_mode }}" == "sequential" ]; then
+            echo "⏱️  Sequential mode: Waiting 5 seconds..."
+            sleep 5
+          fi
+      
+      # ----- STEP 3: TẠO SUMMARY CHO JOB NÀY -----
       - name: Summary
-        if: always()
+        if: always()                                      # Luôn chạy dù job thành công hay fail
         run: |
-          echo "## OTA Deploy → ${{ matrix.target.device_id }}" >> $GITHUB_STEP_SUMMARY
+          # Ghi vào GITHUB_STEP_SUMMARY để hiển thị trong GitHub Actions UI
+          echo "## 📦 OTA Deploy: ${{ matrix.image.name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`${{ steps.payload.outputs.final_image }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Container | \`${{ steps.payload.outputs.container_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Target Device | \`${{ steps.payload.outputs.target }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| MQTT Broker | \`${{ env.MQTT_HOST }}:1883\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Topic | \`${{ steps.payload.outputs.mqtt_topic }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| Run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ steps.payload.outputs.final_image }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Container** | \`${{ steps.payload.outputs.container_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Target** | \`${{ steps.payload.outputs.target }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Mode** | ${{ inputs.deployment_mode }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================
+  # JOB 3: FINAL-SUMMARY - Tổng kết toàn bộ deployment
+  # ============================================
+  # Job này chạy sau cùng, tổng hợp kết quả từ tất cả các jobs
+  # ============================================
+  final-summary:
+    needs: [prepare, send-ota-commands]                  # Chờ cả prepare và send-ota-commands hoàn thành
+    runs-on: ubuntu-latest
+    if: always()                                         # Luôn chạy dù có job fail
+    
+    steps:
+      - name: Generate final deployment summary
+        run: |
+          # Tạo summary tổng hợp
+          echo "# 🚀 OTA Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Phần cấu hình deployment
+          echo "## ⚙️ Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target**: ${{ inputs.target_device }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Mode**: ${{ inputs.deployment_mode }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag**: ${{ inputs.image_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Phần danh sách images đã deploy
+          echo "## 📋 Deployed Images" >> $GITHUB_STEP_SUMMARY
+          # Dùng jq để parse JSON và hiển thị từng image
+          echo '${{ needs.prepare.outputs.images }}' | jq -r '.[] | "- **\(.name)**: `\(.full)`"' >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Phần thứ tự deploy devices (theo priority)
+          echo "## 🖥️ Device Deployment Order" >> $GITHUB_STEP_SUMMARY
+          echo '${{ needs.prepare.outputs.device_matrix }}' | jq -r '.[] | "- **Priority \(.priority)**: `\(.device_id)@\(.tenant_id)`"' >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Phần trạng thái
+          echo "## 📊 Deployment Status" >> $GITHUB_STEP_SUMMARY
+          echo "Check the individual job logs above for detailed results." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View all runs](${{ github.server_url }}/${{ github.repository }}/actions)" >> $GITHUB_STEP_SUMMARY
